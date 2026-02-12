@@ -1,5 +1,9 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 import torch.nn.functional as F
+import math
+from datetime import datetime
 from pathlib import Path
 
 from VAE.VAE import VAE
@@ -9,10 +13,29 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 
+def _ssim_loss(x, y, window_size=11, C1=0.01**2, C2=0.03**2):
+    """1 - SSIM, differentiable. Higher = worse."""
+    pad = window_size // 2
+    # Gaussian-like averaging via avg pool (fast approximation)
+    mu_x = F.avg_pool2d(x, window_size, stride=1, padding=pad)
+    mu_y = F.avg_pool2d(y, window_size, stride=1, padding=pad)
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+    sigma_x2 = F.avg_pool2d(x * x, window_size, stride=1, padding=pad) - mu_x2
+    sigma_y2 = F.avg_pool2d(y * y, window_size, stride=1, padding=pad) - mu_y2
+    sigma_xy = F.avg_pool2d(x * y, window_size, stride=1, padding=pad) - mu_xy
+    ssim = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / \
+           ((mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2))
+    return 1 - ssim.mean()
+
+
 class VAETrainer:
-    def __init__(self, vae: VAE, dataset: Dataset, val_dataset: Dataset = None):
-        # Auto-select device
-        if torch.cuda.is_available():
+    def __init__(self, vae: VAE, dataset: Dataset, val_dataset: Dataset = None, device: str = None):
+        # Select device: explicit > env CUDA_VISIBLE_DEVICES > auto
+        if device is not None:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
             self.device = torch.device("cuda")
         elif torch.backends.mps.is_available():
             self.device = torch.device("mps")
@@ -24,13 +47,13 @@ class VAETrainer:
         self.val_dataset = val_dataset
 
         # Hyperparameters
-        self.batch_size = 8
+        self.batch_size = 16
         self.lr = 1e-4
-        self.num_epochs = 100
+        self.num_epochs = 800
 
         # KL warmup: linearly increase kl_weight from 0 to kl_weight_max
         # over the first kl_warmup_epochs epochs
-        self.kl_weight_max = 0.001
+        self.kl_weight_max = 0.1
         self.kl_warmup_epochs = 20
         self.kl_weight = 0.0
 
@@ -50,17 +73,26 @@ class VAETrainer:
                 num_workers=4, pin_memory=True
             )
 
-        # Output directories
-        self.ckpt_dir = Path("checkpoints")
-        self.sample_dir = Path("samples")
-        self.ckpt_dir.mkdir(exist_ok=True)
-        self.sample_dir.mkdir(exist_ok=True)
+        # Output directories with timestamp to avoid overwriting previous runs
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.ckpt_dir = Path("checkpoints") / timestamp
+        self.sample_dir = Path("samples") / timestamp
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.sample_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving to: {self.ckpt_dir} / {self.sample_dir}")
 
     @staticmethod
     def vae_loss(x, x_hat, mu, logvar, kl_weight=1.0):
-        # Sum over pixels, mean over batch — keeps rec and kl on the same scale
-        rec_loss = F.mse_loss(x_hat, x, reduction="none").sum(dim=(1, 2, 3)).mean()
-        kl_loss = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=(1, 2, 3)).mean()
+        # L1 loss preserves edges better than MSE (which blurs toward mean)
+        l1_loss = F.l1_loss(x_hat, x)
+        # SSIM loss preserves structural detail, contrast and luminance
+        ssim_loss = _ssim_loss(x_hat, x)
+        # Combined reconstruction: L1 for pixel accuracy + SSIM for structure
+        rec_loss = 0.5 * l1_loss + 0.5 * ssim_loss
+        # Free bits: each latent dimension contributes at least 0.25 nats of KL
+        free_bits = 0.25
+        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        kl_loss = torch.clamp(kl_per_dim, min=free_bits).mean()
         return rec_loss + kl_weight * kl_loss, rec_loss, kl_loss
 
     def train_one_epoch(self, epoch):
@@ -78,6 +110,7 @@ class VAETrainer:
 
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             total_loss += loss.item()
@@ -113,7 +146,7 @@ class VAETrainer:
     def save_samples(self, epoch, n=8):
         """Sample from random latent vectors and save generated images"""
         self.vae.eval()
-        z = torch.randn(n, 64, 8, 8, device=self.device)
+        z = torch.randn(n, self.vae.latent_channels, 8, 8, device=self.device)
         samples = self.vae.decoder(z)
         save_image(samples, self.sample_dir / f"epoch_{epoch:03d}.png", nrow=4)
 
@@ -151,8 +184,8 @@ class VAETrainer:
 
             tqdm.write(
                 f"epoch {epoch:3d} | kl_w {self.kl_weight:.5f} | "
-                f"train {train_loss:.2f} (rec {rec_loss:.2f}, kl {kl_loss:.2f}) | "
-                f"val {val_loss:.2f} (rec {val_rec:.2f}, kl {val_kl:.2f})"
+                f"train {train_loss:.5f} (rec {rec_loss:.5f}, kl {kl_loss:.5f}) | "
+                f"val {val_loss:.5f} (rec {val_rec:.5f}, kl {val_kl:.5f})"
             )
 
             # Save samples and checkpoint every 10 epochs
@@ -161,9 +194,9 @@ class VAETrainer:
                 self.reconstruct_samples(epoch)
                 self.save_checkpoint(epoch, train_loss)
 
-            # Save best model based on validation rec loss
-            if val_rec < best_loss:
-                best_loss = val_rec
+            # Save best model based on validation loss (ELBO)
+            if val_loss < best_loss:
+                best_loss = val_loss
                 torch.save(self.vae.state_dict(), self.ckpt_dir / "vae_best.pt")
 
 
@@ -171,7 +204,7 @@ if __name__ == "__main__":
     train_dataset = XRayChestDataset(split="train", img_size=256)
     val_dataset = XRayChestDataset(split="val", img_size=256)
 
-    vae = VAE(latent_channels=64)
+    vae = VAE(latent_channels=16)
 
     trainer = VAETrainer(vae=vae, dataset=train_dataset, val_dataset=val_dataset)
     trainer.train()
