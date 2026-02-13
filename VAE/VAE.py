@@ -27,8 +27,11 @@ class UpBlock(nn.Module):
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         )
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = nn.ReLU(inplace=True)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        # Second conv for more decoder capacity
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
         self.skip = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(in_channels, out_channels, kernel_size=1),
@@ -37,8 +40,31 @@ class UpBlock(nn.Module):
 
     def forward(self, x):
         identity = self.skip(x)
-        out = self.act(self.bn(self.up(x)) + identity)
-        return out
+        out = self.act(self.bn1(self.up(x)))
+        out = self.bn2(self.conv2(out)) + identity
+        return self.act(out)
+
+
+class SelfAttention(nn.Module):
+    """Scaled dot-product self-attention for spatial feature maps."""
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(8, channels), channels)
+        self.q = nn.Conv2d(channels, channels, 1)
+        self.k = nn.Conv2d(channels, channels, 1)
+        self.v = nn.Conv2d(channels, channels, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        q = self.q(h).reshape(B, C, H * W)
+        k = self.k(h).reshape(B, C, H * W)
+        v = self.v(h).reshape(B, C, H * W)
+        attn = torch.bmm(q.transpose(1, 2), k) * (C ** -0.5)
+        attn = attn.softmax(dim=-1)
+        out = torch.bmm(v, attn.transpose(1, 2)).reshape(B, C, H, W)
+        return x + self.proj(out)
 
 
 # VAE
@@ -47,13 +73,14 @@ class UpBlock(nn.Module):
 # Decoder(z) -> x_hat
 
 class Encoder(nn.Module):
-    """Input (B, 1, 256, 256) -> Output mu, logvar each (B, 16, 8, 8)"""
+    """Input (B, 1, 256, 256) -> Output mu, logvar each (B, latent_ch, 8, 8)"""
     def __init__(self, latent_channels=16):
         super().__init__()
         self.down1 = DownBlock(1, 32)       # 256 -> 128
         self.down2 = DownBlock(32, 64)      # 128 -> 64
         self.down3 = DownBlock(64, 128)     # 64  -> 32
         self.down4 = DownBlock(128, 256)    # 32  -> 16
+        self.attn = SelfAttention(256)      # self-attention at 16x16
         self.down5 = DownBlock(256, 512)    # 16  -> 8
 
         # Separate 1x1 convolutions to produce mu and logvar independently
@@ -65,6 +92,7 @@ class Encoder(nn.Module):
         x = self.down2(x)
         x = self.down3(x)
         x = self.down4(x)
+        x = self.attn(x)
         x = self.down5(x)
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x).clamp(-10, 10)
@@ -72,11 +100,12 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Input z (B, 16, 8, 8) -> Output (B, 1, 256, 256)"""
+    """Input z (B, latent_ch, 8, 8) -> Output (B, 1, 256, 256)"""
     def __init__(self, latent_channels=16):
         super().__init__()
         self.proj = nn.Conv2d(latent_channels, 512, kernel_size=1)
         self.up1 = UpBlock(512, 256)    # 8  -> 16
+        self.attn = SelfAttention(256)  # self-attention at 16x16
         self.up2 = UpBlock(256, 128)    # 16 -> 32
         self.up3 = UpBlock(128, 64)     # 32 -> 64
         self.up4 = UpBlock(64, 32)      # 64 -> 128
@@ -86,6 +115,7 @@ class Decoder(nn.Module):
     def forward(self, z):
         z = self.proj(z)
         z = self.up1(z)
+        z = self.attn(z)
         z = self.up2(z)
         z = self.up3(z)
         z = self.up4(z)
@@ -107,7 +137,7 @@ class VAE(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
         # Near-zero init for mu/logvar heads so latent starts near N(0,1)
@@ -115,6 +145,11 @@ class VAE(nn.Module):
         nn.init.zeros_(self.encoder.fc_mu.bias)
         nn.init.xavier_uniform_(self.encoder.fc_logvar.weight, gain=0.01)
         nn.init.zeros_(self.encoder.fc_logvar.bias)
+        # Zero init for self-attention output projections (start as identity)
+        for m in self.modules():
+            if isinstance(m, SelfAttention):
+                nn.init.zeros_(m.proj.weight)
+                nn.init.zeros_(m.proj.bias)
 
     def reparameterize(self, mu, logvar):
         """Reparameterization trick: sample during training, use mu at inference"""

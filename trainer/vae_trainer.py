@@ -30,6 +30,13 @@ def _ssim_loss(x, y, window_size=11, C1=0.01**2, C2=0.03**2):
     return 1 - ssim.mean()
 
 
+def _spectral_loss(x, y):
+    """Frequency-domain L1 loss — penalizes blurring of high-frequency detail."""
+    x_freq = torch.fft.rfft2(x, norm='ortho')
+    y_freq = torch.fft.rfft2(y, norm='ortho')
+    return (x_freq - y_freq).abs().mean()
+
+
 class VAETrainer:
     def __init__(self, vae: VAE, dataset: Dataset, val_dataset: Dataset = None, device: str = None):
         # Select device: explicit > env CUDA_VISIBLE_DEVICES > auto
@@ -53,8 +60,8 @@ class VAETrainer:
 
         # KL warmup: linearly increase kl_weight from 0 to kl_weight_max
         # over the first kl_warmup_epochs epochs
-        self.kl_weight_max = 0.1
-        self.kl_warmup_epochs = 20
+        self.kl_weight_max = 0.5
+        self.kl_warmup_epochs = 40
         self.kl_weight = 0.0
 
         self.optimizer = torch.optim.Adam(self.vae.parameters(), lr=self.lr)
@@ -83,14 +90,22 @@ class VAETrainer:
 
     @staticmethod
     def vae_loss(x, x_hat, mu, logvar, kl_weight=1.0):
-        # L1 loss preserves edges better than MSE (which blurs toward mean)
-        l1_loss = F.l1_loss(x_hat, x)
-        # SSIM loss preserves structural detail, contrast and luminance
-        ssim_loss = _ssim_loss(x_hat, x)
-        # Combined reconstruction: L1 for pixel accuracy + SSIM for structure
-        rec_loss = 0.5 * l1_loss + 0.5 * ssim_loss
-        # Free bits: each latent dimension contributes at least 0.25 nats of KL
-        free_bits = 0.25
+        # --- Multi-scale reconstruction (L1 + SSIM at 3 scales) ---
+        ms_rec = 0.0
+        for scale in [1, 2, 4]:
+            if scale > 1:
+                x_s = F.avg_pool2d(x, scale)
+                xh_s = F.avg_pool2d(x_hat, scale)
+            else:
+                x_s, xh_s = x, x_hat
+            ms_rec += 0.5 * F.l1_loss(xh_s, x_s) + 0.5 * _ssim_loss(xh_s, x_s)
+        ms_rec /= 3.0
+        # --- Spectral (FFT) loss for sharpness ---
+        spec = _spectral_loss(x_hat, x)
+        # Combined reconstruction = multi-scale spatial + spectral
+        rec_loss = ms_rec + 0.1 * spec
+        # --- KL divergence with free bits ---
+        free_bits = 0.05
         kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
         kl_loss = torch.clamp(kl_per_dim, min=free_bits).mean()
         return rec_loss + kl_weight * kl_loss, rec_loss, kl_loss
@@ -204,7 +219,7 @@ if __name__ == "__main__":
     train_dataset = XRayChestDataset(split="train", img_size=256)
     val_dataset = XRayChestDataset(split="val", img_size=256)
 
-    vae = VAE(latent_channels=16)
+    vae = VAE(latent_channels=8)
 
     trainer = VAETrainer(vae=vae, dataset=train_dataset, val_dataset=val_dataset)
     trainer.train()
