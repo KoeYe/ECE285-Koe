@@ -1,0 +1,22 @@
+# Pre-trained base model weights (download from HuggingFace)
+models/qwen2vl/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# LaTeX auxiliary files
+*.aux
+*.log
+*.out
+*.nav
+*.snm
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/

@@ -1,0 +1,68 @@
+ECE 285 Final — 中文讲稿（约3分钟）
+数字速查：PSNR 34.66 dB / SSIM 0.9959 / Drift_10 0.023 / 规划SR 两者均5%
+══════════════════════════════════════════════════════
+
+SLIDE 1 — Title
+我们做的是 action-conditioned world modeling，
+就是给一张图和一个动作，预测下一帧长什么样。
+
+SLIDE 2 — The Problem
+之前的方法要么直接在像素空间预测，没有语义结构；
+要么在纯 latent 空间里，但没法解码回像素。
+我们的思路是在中间搭一个 latent token block，
+两头都能接——左边 Transformer 生成它，右边 U-Net 解码成图。
+
+SLIDE 3 — Architecture
+模型分四块：CNN Encoder、Action Embedding、
+4 层 Transformer Predictor 输出 K=8 个 latent token，
+最后 U-Net Decoder 还原成 64x64 图。
+总共 5.8M 参数。
+
+SLIDE 4 — Three-Stage Training
+训练分三步来做优化分解。
+Stage 0 先让 Decoder 学会 FrozenLake 的视觉域，31.3 dB。
+Stage 1 冻住 Encoder 和 Decoder，只训 Predictor 对齐 latent，cosine sim 0.997。
+Stage 2 端到端联合训练，加 embedding 正则，最终 34.66 dB。
+
+SLIDE 5 — Setup
+环境是确定性的 FrozenLake，自定义 64x64 渲染器。
+200 张随机地图，148K 条 transition，单卡 L40S，不到 3 小时跑完。
+
+SLIDE 6 — Main Results
+PSNR 34.66，比 baseline 高 3.36 dB；SSIM 0.9959；
+10 步自回归之后 Drift 还是 0.023，质量保持得很好。
+关键是 embedding loss 在 feature space 做正则，不只是对齐像素，
+这让多步 rollout 更稳定。
+
+SLIDE 7 — Rollout Visualization
+这是连续 10 步的自回归预测，每行是 GT / 预测 / 误差图。
+前 8 步 agent 位置和格子颜色都准，误差主要在洞和边界。
+
+SLIDE 8 — Ablation
+四组对照：
+去掉 Stage 0，PSNR 崩到 9.45；
+去掉 embedding loss，单步差不多但多步漂 65%；
+K=8 是最优，K=2/4 信息量不够；
+部分解冻 Decoder 虽然 PSNR 到 49，但那是把 latent 记忆化了，退化解。
+
+SLIDE 9 & 10 — Latent Space
+PCA 里 4 个 action 形成清晰的 cluster，每个 cluster 又分两个 sub-cloud。
+这对应两种物理情况：agent 成功移动 vs. 撞墙 no-op。
+没有任何显式监督，是自然涌现的。
+
+SLIDE 11 — Key Insights
+三个结论：embedding loss 创造稳定吸引子、冻住 Decoder 是归纳偏置不是限制、
+阶段式训练让每步优化都可以收敛。
+
+SLIDE 12 — Planning
+我们拿 LoRA 微调的 Qwen2-VL-2B 测下游规划，
+WM 接入方式是：对 4 个 action 各预测一帧，让 VLM 从预测帧再推理，
+剔掉那些预测结果让 VLM 想反向的 action。
+结果：VLM-only 5%，VLM+WM 也是 5%，持平。
+原因是单步 lookahead 本质还是 greedy search，没法跳出死角。
+高 PSNR 不等于规划增益，需要多步 rollout 加 value function。
+
+SLIDE 13 — Conclusion
+总结：三阶段训练、5.8M 参数、单卡 3 小时，PSNR 34.66，多步稳定。
+阶段式训练和 embedding 正则是两个核心设计。
+后续方向是 scheduled sampling、随机环境、以及配 value function 的多步规划。

@@ -1,0 +1,80 @@
+ECE 285 Final — English Script (~3 minutes)
+Quick ref: PSNR 34.66 dB / SSIM 0.9959 / Drift_10 0.023 / Planning SR both 5%
+══════════════════════════════════════════════════════
+
+SLIDE 1 — Title
+We're working on action-conditioned world modeling —
+given a frame and an action, predict what the next frame looks like.
+
+SLIDE 2 — The Problem
+Existing approaches are at two extremes.
+Pixel-space models lack semantic structure; pure latent models can't decode back to pixels.
+We sit in the middle: a latent token block that a Transformer generates
+and a U-Net directly decodes into a pixel prediction.
+
+SLIDE 3 — Architecture
+Four components: a CNN encoder, an action embedding,
+a 4-layer Transformer predictor that outputs K=8 latent tokens,
+and a U-Net decoder that maps those tokens back to a 64x64 RGB frame.
+Total: 5.8M parameters.
+
+SLIDE 4 — Three-Stage Training
+We decompose training into three stages.
+Stage 0 warms up the decoder on the FrozenLake visual domain — gets us to 31.3 dB.
+Stage 1 freezes everything except the predictor and aligns its latent output to
+the encoder's real latents — cosine similarity hits 0.997.
+Stage 2 trains end-to-end with an embedding regularization term — final PSNR 34.66 dB.
+
+SLIDE 5 — Setup
+FrozenLake, deterministic, custom 64x64 renderer.
+200 random maps, 148K transitions, single L40S GPU, under 3 hours total.
+
+SLIDE 6 — Main Results
+PSNR 34.66 dB, up 3.36 from our baseline.
+SSIM 0.9959 — near-perfect structural match.
+Drift_10 is 0.023, so quality holds up across 10 auto-regressive steps.
+The embedding loss is what keeps rollouts stable —
+it regularizes in feature space, not just pixels.
+
+SLIDE 7 — Rollout Visualization
+Ten auto-regressive steps, no ground truth feedback.
+Each row: GT, prediction, error ×10.
+Agent position and tile colors track well through step 8;
+errors cluster at holes and boundaries.
+
+SLIDE 8 — Ablation
+Four ablations.
+No Stage 0 collapses to 9.45 dB — the decoder needs its visual prior.
+No embedding loss keeps one-step PSNR similar but multi-step drift worsens 65%.
+K=8 is the sweet spot over K=2/4/16.
+Unfreezing the decoder inflates PSNR to 49 dB, but it's a degenerate solution
+— the model just memorizes latents instead of learning dynamics.
+
+SLIDE 9 & 10 — Latent Space
+PCA of the predicted latents shows four clean clusters, one per action.
+Each cluster splits into two sub-clouds: effective transitions vs. boundary no-ops
+where the agent hits a wall and nothing changes.
+This structure emerges with no explicit supervision —
+the decoder forces the predictor to separate them.
+
+SLIDE 11 — Key Insights
+Three takeaways: the embedding loss acts as a stable attractor for rollouts,
+freezing the decoder is an inductive bias not a limitation,
+and staged training makes an otherwise intractable optimization tractable.
+
+SLIDE 12 — Planning
+We pair the world model with a LoRA fine-tuned Qwen2-VL-2B for a planning experiment.
+The integration is a lookahead-consistency filter:
+the WM predicts next frames for all 4 actions,
+the VLM re-evaluates from each, and we prune actions that want to immediately reverse.
+Result: VLM-only 5%, VLM+WM 5% — they tie.
+Single-step lookahead is still greedy search; it can't escape local dead ends.
+High prediction quality does not automatically translate to planning gains —
+you need multi-step rollout with a value function.
+
+SLIDE 13 — Conclusion
+Three-stage latent world model, 5.8M params, single GPU, under 3 hours.
+PSNR 34.66, stable multi-step rollouts.
+Staged training and embedding regularization are the two key design choices.
+Next steps: scheduled sampling, stochastic environments,
+and multi-step planning with a learned value function.

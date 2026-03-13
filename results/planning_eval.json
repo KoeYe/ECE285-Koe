@@ -1,0 +1,30 @@
+{
+  "oracle_bfs": {
+    "success_rate": 1.0,
+    "n_success": 100,
+    "n_episodes": 100,
+    "avg_steps_success": 14.0,
+    "avg_steps_all": 14.0
+  },
+  "vlm_only": {
+    "success_rate": 0.05,
+    "n_success": 5,
+    "n_episodes": 100,
+    "avg_steps_success": 14.0,
+    "avg_steps_all": 5.5
+  },
+  "vlm_wm": {
+    "success_rate": 0.05,
+    "n_success": 5,
+    "n_episodes": 100,
+    "avg_steps_success": 14.0,
+    "avg_steps_all": 5.5
+  },
+  "config": {
+    "n_maps": 20,
+    "n_eps": 5,
+    "max_steps": 80,
+    "method": "A",
+    "eval_seed": 1234
+  }
+}

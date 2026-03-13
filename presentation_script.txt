@@ -1,0 +1,492 @@
+ECE 285 Final Presentation Script
+"Shaping Latent World Models via Latent Reasoning for Planning and Generalization"
+===================================================================================
+
+Numbers to remember:
+  PSNR = 34.66 dB  (+3.36 over Stage 0 baseline 31.30)
+  SSIM = 0.9959
+  Drift_10 = 0.02341
+  Planning SR: VLM-only = 5%,  VLM+WM = 5%,  Oracle BFS = 100%
+
+
+███████████████████████████████████████████████████████████████
+  中文版
+███████████████████████████████████████████████████████████████
+
+──────────────────────────────────────────────────────────────
+SLIDE 1 — Title
+──────────────────────────────────────────────────────────────
+我们研究的问题是 action-conditioned world modeling，
+也就是给定当前帧和动作，预测下一帧。
+我们用一个结构化的 latent token block 作为中间表示，
+训练分三个阶段完成，整个模型只有 5.8M 参数，
+在单卡上三小时以内能跑完。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 2 — The Problem
+──────────────────────────────────────────────────────────────
+核心问题是，之前的方法要么在像素空间里做预测，缺乏语义结构；
+要么做纯 latent 的预测，但很难还原回像素。
+
+我们的做法是中间路线：
+用一个固定长度的 latent token block z-hat，
+它既能被 Transformer predictor 生成，又能直接被 U-Net decoder 解码成像素。
+
+公式：给定 (o_t, a_t)，先通过 f_theta 生成 z-hat，再通过 g_phi 解码成 o-hat。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 3 — Architecture
+──────────────────────────────────────────────────────────────
+模型由四个组件构成。
+
+Vision Encoder：四层 CNN，把 64x64 输入帧编码成 64 个 patch token。
+Action Encoder：把离散动作 L/D/R/U 嵌入一个 64 维向量。
+Latent Predictor f_theta：4 层 Transformer，输入 encoder 输出和 action embedding，
+  输出 K=8 个 d=128 的 latent token，共 1.5M 参数。
+Pixel Decoder g_phi：U-Net 加 cross-attention，
+  把 latent block 解码成 64x64 RGB 图，4M 参数。
+
+总参数 5.8M，右边是数据流图。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 4 — Three-Stage Training
+──────────────────────────────────────────────────────────────
+训练分三个 stage，核心思路是把优化问题分解开来。
+
+Stage 0：单独训练 Encoder 和 Decoder，做条件自编码，
+  让 Decoder 先学会 FrozenLake 的视觉域。
+  20 个 epoch，PSNR 31.3 dB，这是后续所有比较的 baseline。
+
+Stage 1：冻结 Encoder 和 Decoder，只训练 Latent Predictor，
+  目标是让 z-hat 对齐 Encoder 编出来的真实 latent z*。
+  15 个 epoch，cosine similarity 0.997，latent 格式对齐。
+
+Stage 2：端到端联合训练，
+  loss = 像素重建 loss + lambda * embedding 正则，lambda=0.1。
+  30 个 epoch，最终 PSNR 34.66 dB。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 5 — Experimental Setup
+──────────────────────────────────────────────────────────────
+环境是 FrozenLake-v1，8x8 网格，确定性，
+我们自己写了 64x64 RGB 渲染器，
+格子颜色：冰面蓝，洞黑，目标绿，agent 橙。
+
+数据：200 个随机地图，每张 750 个 random rollout，
+约 148K transition，按 160/20/20 分 train/val/test。
+硬件：单卡 NVIDIA L40S。
+
+选 FrozenLake 的原因：确定性环境出现预测误差一定是模型问题，
+不是环境随机性；ablation 干净；整个流程不到 3 小时。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 6 — Main Results
+──────────────────────────────────────────────────────────────
+主要结果：
+PSNR 34.66 dB，比 Stage 0 baseline 高 3.36 dB。
+SSIM 0.9959，结构相似度接近完美。
+Drift_10 = 0.02341，连续自回归 10 步之后误差依然很小。
+
+右边说明了数字含义：
+PSNR > 35 dB 在 64x64 上像素误差几乎不可见；
+Drift_10 < 0.006 说明多步 rollout 质量持续稳定。
+
+关键机制：embedding loss 在 feature space 施加约束，
+不只是对齐像素，这是 rollout 稳定的核心原因。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 7 — Rollout Visualization
+──────────────────────────────────────────────────────────────
+这是多步 rollout 可视化，每行三张：GT / 预测 / 误差图（x10 放大）。
+没有任何 GT 反馈，纯自回归。
+
+前 8 步，agent 位置和格子颜色都预测准确。
+误差集中在洞的边缘和地图边界，
+因为 boundary no-op 和正常移动在 latent 上是不同分布。
+下一张会解释这个现象。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 8 — Ablation Study
+──────────────────────────────────────────────────────────────
+四组 ablation：
+
+No Stage 0：PSNR 直接崩到 9.45 dB。decoder 预适应是必须的。
+
+Lambda：
+  lambda=0，PSNR 接近（34.58），但 Drift_5 比默认高 65%，多步不稳。
+  lambda=1.0，过约束，PSNR 降到 32.23。lambda=0.1 最优。
+
+K（latent block 长度）：
+  K=2: 33.50，K=4: 33.94，K=16: 34.34，K=8: 34.66。K=8 是 sweet spot。
+
+部分解冻 decoder：PSNR 虚高到 49.57，
+  但那是 decoder 把真实 latent 记忆化了，退化解，不是 world model。
+  冻住 decoder 是归纳偏置，不是限制。
+
+右边 drift 曲线：蓝线平稳，lambda=0 漂移，No Stage 0 立刻崩。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 9 — Latent Space Analysis
+──────────────────────────────────────────────────────────────
+PCA 可视化：2000 个 test sample，按 action 颜色标注。
+四个 action 形成清晰分离的 cluster，
+说明 latent predictor 学到了 action-conditioned 的结构，
+没有任何显式 clustering 监督。
+
+每个 cluster 内部有两个 sub-cloud，原因见下一张。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 10 — Bimodal Latent Structure
+──────────────────────────────────────────────────────────────
+每个 action cluster 分成两个 sub-cloud，对应两种物理情况：
+一种是 agent 在墙边，动作无效，o_t = o_{t+1}，即 boundary no-op；
+另一种是 agent 成功移动，observation 发生变化。
+
+这是自然涌现的，完全没有显式监督：
+decoder 对两种情况要产生不同的像素输出，
+反向传播迫使 latent predictor 在 latent space 把两者分开。
+
+数据里约 24.7% 的 transition 是 boundary no-op，
+比例很高，所以模型必须学会区分它们。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 11 — Key Insights
+──────────────────────────────────────────────────────────────
+三个关键 insight：
+
+Insight 2，Embedding loss 创造稳定吸引子：
+  PSNR 从 t+1 到 t+8 快速下降后趋于平稳。
+  去掉 embedding loss，Drift_5 恶化 65%。
+  feature space 约束比单纯像素约束更有效。
+
+Insight 3，冻结 decoder 是归纳偏置：
+  解冻之后 PSNR 虚高到 49.57，但那是 lookup table，不是 world model。
+  冻住迫使 f_theta 学习真正的 transition 规律。
+
+Insight 4，阶段式训练是优化分解：
+  直接端到端从头训练，9.45 dB，崩了。
+  三阶段分别缩小搜索空间，让每步都能收敛。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 12 — Stage 3: Planning
+──────────────────────────────────────────────────────────────
+最后一个实验：world model 能否帮助下游规划？
+
+设置：20 个 held-out 地图，每张 5 个 episode，最多 80 步。
+VLM 用 Qwen2-VL-2B，在 20K 个 BFS 标注的 transition 上做了 LoRA 微调（r=16）。
+
+WM 接入方式叫 lookahead-consistency filter：
+  1. VLM 给出当前帧的首选 action
+  2. WM 对全部 4 个 action 各预测一个未来帧
+  3. VLM 从每个预测帧再推理一次动作
+  4. 剔除那些预测结果让 VLM 想立刻反向的 action
+  5. 在剩余候选里返回 VLM 的首选
+
+结果：VLM-only 5%，VLM+WM 5%，Oracle BFS 100%，两者持平。
+
+原因：单步 lookahead 等价于在 WM latent 空间做 greedy search，
+遇到局部死角同样无法恢复。reversal filter 触发概率很低，
+大多数 action 直接通过，结果退化成 VLM-only。
+
+结论：WM 预测质量高（34.66 dB）不自动带来规划增益，
+需要多步 rollout 加 value function。
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 13 — Conclusion
+──────────────────────────────────────────────────────────────
+总结：
+三阶段 latent world model，5.8M 参数，单卡 3 小时内训完。
+PSNR 34.66 dB，SSIM 0.9959，多步 rollout 稳定。
+
+两个关键设计：
+阶段式训练做优化分解；embedding 正则保持 rollout 稳定。
+
+规划实验说明：高质量预测不自动转化为规划增益。
+
+Future work：scheduled sampling，stochastic 环境，
+contrastive embedding 目标，多步 rollout 加 value function。
+
+
+███████████████████████████████████████████████████████████████
+  English Version
+███████████████████████████████████████████████████████████████
+
+──────────────────────────────────────────────────────────────
+SLIDE 1 — Title
+──────────────────────────────────────────────────────────────
+We work on action-conditioned world modeling —
+given the current observation and an action, predict the next frame.
+Our key idea is to use a structured latent token block as an intermediate state carrier.
+Training is split into three stages, the full model has 5.8 million parameters,
+and it trains from scratch on a single GPU in under three hours.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 2 — The Problem
+──────────────────────────────────────────────────────────────
+Prior work sits at two extremes.
+Pixel-space models directly predict RGB frames but have no semantic structure.
+Pure latent models work in abstract spaces that are hard to decode back to pixels.
+
+We take a middle path: a fixed-length latent token block z-hat
+that is both generated by a Transformer predictor and directly decodable
+by a U-Net decoder into pixel predictions.
+
+The inference chain is: (o_t, a_t) → f_theta → z-hat → g_phi → o-hat_{t+1}.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 3 — Architecture
+──────────────────────────────────────────────────────────────
+The model has four components.
+
+The Vision Encoder is a four-layer CNN that encodes a 64x64 input frame
+into 64 patch tokens of dimension 64.
+
+The Action Encoder embeds each discrete action — left, down, right, up —
+into a 64-dimensional vector.
+
+The Latent Predictor f_theta is a 4-layer Transformer.
+It takes the encoder output and action embedding,
+and outputs K=8 latent tokens of dimension 128. This is 1.5M parameters.
+
+The Pixel Decoder g_phi is a U-Net with a cross-attention bottleneck.
+It takes the latent block and decodes it to a 64x64 RGB image. That's 4M parameters.
+
+Total: 5.8M parameters. The right side shows the data flow.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 4 — Three-Stage Training
+──────────────────────────────────────────────────────────────
+Training is decomposed into three stages, each targeting a different subproblem.
+
+Stage 0 trains the Encoder and Decoder together as a conditional autoencoder,
+so the decoder learns the FrozenLake visual domain before anything else.
+20 epochs, PSNR reaches 31.3 dB. This is our baseline for all comparisons.
+
+Stage 1 freezes the Encoder and Decoder and trains only the Latent Predictor,
+aligning its output z-hat to match the encoder's real latent z-star.
+15 epochs, cosine similarity reaches 0.997. The latent format is now stabilized.
+
+Stage 2 trains end-to-end with a combined pixel reconstruction loss
+plus an embedding regularization term, lambda=0.1.
+30 epochs. Final PSNR: 34.66 dB.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 5 — Experimental Setup
+──────────────────────────────────────────────────────────────
+The environment is FrozenLake-v1, 8x8 grid, deterministic.
+We wrote a custom 64x64 RGB renderer: ice tiles are blue, holes black,
+the goal green, and the agent orange.
+
+Dataset: 200 random map seeds, 750 random-action rollouts per map,
+about 148K transitions total, split 160/20/20 for train/val/test.
+Hardware: single NVIDIA L40S GPU.
+
+We chose FrozenLake because it's deterministic — any prediction error
+is purely a model failure, not environmental noise —
+and because ablations are fast and clean. The whole pipeline runs in under 3 hours.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 6 — Main Results
+──────────────────────────────────────────────────────────────
+Our full model achieves:
+PSNR 34.66 dB, which is +3.36 dB over the Stage 0 baseline.
+SSIM 0.9959, near-perfect structural similarity.
+Drift_10 = 0.02341, meaning quality stays high over 10 auto-regressive steps.
+
+The right panel puts these numbers in context:
+at 64x64 resolution, PSNR above 35 dB means pixel errors are essentially invisible.
+Drift_10 below 0.006 means the model remains stable over long rollouts.
+
+The embedding loss is the key mechanism — it penalizes drift in feature space,
+not just at the pixel level, and that's what makes multi-step rollouts stable.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 7 — Rollout Visualization
+──────────────────────────────────────────────────────────────
+This shows multi-step rollout outputs. Each row has three images:
+ground truth, prediction, and error map scaled by 10.
+These are fully auto-regressive — no ground truth is fed back after the first frame.
+
+For steps 1 through 8, the agent position and tile colors are tracked accurately.
+Errors concentrate near holes and at map boundaries.
+That's because boundary no-ops — where the agent is stuck at a wall —
+and effective transitions have different latent distributions.
+The next slide explains this.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 8 — Ablation Study
+──────────────────────────────────────────────────────────────
+We ran four ablation sweeps, each for 5 epochs.
+
+No Stage 0: PSNR collapses to 9.45 dB.
+The decoder has no visual prior; training diverges immediately.
+
+Lambda, the embedding loss weight:
+  lambda=0 gives similar one-step PSNR (34.58) but Drift_5 is 65% worse.
+  lambda=1.0 over-constrains and drops PSNR to 32.23.
+  lambda=0.1 is optimal.
+
+K, the latent block length:
+  K=2: 33.50, K=4: 33.94, K=16: 34.34, K=8: 34.66.
+  K=8 is the sweet spot.
+
+Partial decoder unfreeze: PSNR inflates to 49.57 dB.
+  This is a degenerate solution — the output layers memorize the rendering function
+  rather than learning a general world model.
+  Freezing the decoder is an intentional inductive bias.
+
+The drift curves on the right show: the full model is stable,
+lambda=0 drifts, and No Stage 0 collapses immediately.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 9 — Latent Space Analysis
+──────────────────────────────────────────────────────────────
+This is a PCA visualization of the predicted latents z-hat,
+using 2000 test samples colored by action.
+
+Four clearly separated clusters emerge, one per action.
+This means the latent predictor has learned action-conditioned structure
+with no explicit clustering supervision.
+
+But each cluster splits into two sub-clouds. What does that mean? Next slide.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 10 — Bimodal Latent Structure
+──────────────────────────────────────────────────────────────
+Each action cluster splits into two sub-clouds corresponding to two physical cases.
+
+The first is a boundary no-op: the agent is at a wall,
+the action has no effect, and o_t equals o_{t+1}.
+
+The second is an effective transition: the agent moves,
+and the observation shifts by one cell.
+
+This structure emerges without any explicit supervision.
+The decoder must produce different pixel outputs for the two cases,
+so backpropagation forces the latent predictor to separate them in latent space.
+
+About 24.7% of test transitions are boundary no-ops — a large fraction —
+so the model has strong pressure to make this distinction.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 11 — Key Insights
+──────────────────────────────────────────────────────────────
+Three key insights from our analysis.
+
+Insight 2 — Embedding loss creates a stable attractor:
+  PSNR drops from t+1 to t+8, then plateaus.
+  Without the embedding term, Drift_5 worsens by 65%.
+  Feature-space regularization is more effective than pixel loss alone.
+
+Insight 3 — Frozen decoder is an inductive bias, not a limitation:
+  Unfreezing inflates PSNR to 49.57, but the model degenerates into a lookup table.
+  Freezing forces f_theta to learn general transition dynamics.
+
+Insight 4 — Staged training is optimization decomposition:
+  End-to-end training from scratch collapses to 9.45 dB.
+  Each stage narrows the search space for the next,
+  making the overall optimization tractable.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 12 — Stage 3: Planning
+──────────────────────────────────────────────────────────────
+The final experiment asks: does world model quality translate to planning performance?
+
+Setup: 20 held-out maps, 5 episodes each, maximum 80 steps per episode.
+We fine-tuned Qwen2-VL-2B with LoRA (r=16) on 20K BFS-labeled transitions
+to serve as both the baseline policy and the evaluator.
+
+The WM is integrated via a lookahead-consistency filter:
+  Step 1: VLM picks a primary action from the current frame.
+  Step 2: WM predicts the next frame for all 4 possible actions.
+  Step 3: VLM is re-queried from each of those 4 predicted frames.
+  Step 4: Actions whose predicted future elicits an immediate reversal are pruned.
+  Step 5: Return the VLM's primary choice among the surviving actions.
+
+Results: VLM-only 5%, VLM+WM 5%, Oracle BFS 100%. Both methods tie.
+
+Why? Single-step lookahead is equivalent to greedy search in the WM's latent space.
+It can still walk into dead ends with no way to backtrack.
+The reversal filter rarely triggers — most actions pass through —
+so the behavior degenerates to VLM-only.
+
+The takeaway: high prediction quality (34.66 dB PSNR) does not automatically
+translate to planning gains. Multi-step rollouts with a value function are needed.
+
+
+──────────────────────────────────────────────────────────────
+SLIDE 13 — Conclusion
+──────────────────────────────────────────────────────────────
+To summarize:
+
+We built a three-stage latent world model.
+5.8M parameters, trained from scratch on a single GPU in under 3 hours.
+PSNR 34.66 dB, SSIM 0.9959, stable multi-step rollouts.
+
+Two design choices are critical:
+staged training as optimization decomposition,
+and embedding regularization for rollout stability.
+
+The planning experiment shows that prediction quality and planning utility
+are distinct: high fidelity alone is not sufficient.
+
+Future directions include scheduled sampling to reduce exposure bias,
+evaluation on stochastic and continuous environments,
+contrastive embedding objectives,
+and multi-step WM rollouts paired with a learned value function.
+
+
+===================================================================================
+Q&A Reference (both versions)
+===================================================================================
+
+Q: Why not use a larger model?
+A: 5.8M parameters is an intentional constraint to validate the staged training
+   strategy rather than relying on scale. Scaling is orthogonal to the contribution.
+
+Q: Why is VLM success rate only 5%?
+A: FrozenLake requires navigating around holes without a map prior.
+   The LoRA fine-tuning is on random-action trajectories, not optimal paths,
+   so the VLM itself is a weak baseline by design.
+
+Q: PSNR is high — why didn't planning improve?
+A: Accurate next-frame prediction does not encode which path leads to the goal.
+   Greedy single-step lookahead is equivalent to asking the VLM directly.
+   Multi-step rollout with a value function is needed to escape local dead ends.
+
+Q: Isn't FrozenLake too simple?
+A: Yes — that's explicitly stated in Limitations. Determinism and small state space
+   make ablations clean. Stochastic and continuous environments are future work.
+
+Q: How was K=8 chosen?
+A: Ablation across K=2/4/8/16. K=8 is the PSNR sweet spot;
+   K=16 adds minimal gain at higher compute cost.
+
+Q: How is the Stage 1 cosine similarity of 0.997 measured?
+A: For every transition in the validation set, we compute the cosine similarity
+   between f_theta's output z-hat and the encoder's true latent z-star,
+   then average. 0.997 confirms directional alignment;
+   Stage 2's pixel loss handles any residual scale mismatch.
